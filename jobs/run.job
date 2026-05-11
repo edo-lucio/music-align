@@ -1,0 +1,32 @@
+#!/bin/bash
+#SBATCH --job-name=analyze
+#SBATCH --output=logs/analyze_%j.out
+#SBATCH --error=logs/analyze_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --partition=scavenge
+#SBATCH --gres=gpu:1
+#SBATCH --mail-user=edlu@itu.dk
+#SBATCH --mail-type=FAIL
+
+set -e
+set -x
+
+# --- 1. Environment & Path Definitions ---
+PROJECT_DIR="$HOME/music-align"
+ENV_PATH="/home/edlu/miniconda3-25-5-1-1/envs/gwot"
+CONDA_BIN="/opt/itu/easybuild/software/Miniconda3/25.5.1-1/bin/conda"
+
+# --- 2. Load System Modules ---
+module load CUDA/12.1.1
+module load NCCL/2.18.3-GCCcore-12.3.0-CUDA-12.1.1
+module load Miniconda3/25.5.1-1
+source /opt/itu/easybuild/software/Miniconda3/25.5.1-1/etc/profile.d/conda.sh
+conda activate "$ENV_PATH"
+cd "$PROJECT_DIR"
+mkdir -p logs
+
+python ./analyze.py
