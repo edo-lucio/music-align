@@ -29,4 +29,6 @@ conda activate "$ENV_PATH"
 cd "$PROJECT_DIR"
 mkdir -p logs
 
-python ./cca_analysis.py
+python ./manifold_health.py
+python ./comparison_matrix.py
+python ./report.py

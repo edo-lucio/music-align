@@ -1,4 +1,4 @@
-"""Read cca_results.json, print ranked summary, save interpretation plots.
+"""Read comparison_matrix.json, print ranked summary, save interpretation plots.
 
 Usage: python report.py
 Outputs:
@@ -17,10 +17,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-RESULTS = Path("cca_results.json")
+RESULTS = Path("comparison_matrix.json")
 PLOTS = Path("plots")
 HEADLINE_K = 5
-PRIMARY_METRIC = "recall_at_10"
+PRIMARY_METRIC = "recall_at_11"   # 11 = n_classes; class-level chance ≈ 0.66
 
 
 def chance_recall_at_k(per_class, n_test, k):
@@ -35,15 +35,20 @@ def chance_recall_at_k(per_class, n_test, k):
     return 1.0 - p_none
 
 
-def chance_baselines(n_test=44, n_class=11):
+def chance_baselines(n_test=242, n_class=11):
+    """Defaults assume the full-data unsupervised setup (no train/test split)."""
     per = n_test // n_class
     return {
         "class_purity":     per / n_test,
         "recall_at_5":      chance_recall_at_k(per, n_test, 5),
-        "recall_at_10":     chance_recall_at_k(per, n_test, 10),
+        "recall_at_11":     chance_recall_at_k(per, n_test, 11),
+        "recall_at_22":     chance_recall_at_k(per, n_test, 22),
         "instance_r_at_1":  1 / n_test,
         "instance_r_at_10": 10 / n_test,
         "hungarian_purity": float("nan"),  # depends on N, classes, not closed-form
+        "foscttm":          0.5,
+        "gw_cost":          float("nan"),
+        "dcor_postdecomp":  float("nan"),
     }
 
 
@@ -74,7 +79,7 @@ def group_by_method_at_k(rows, k, metric):
 
 
 def print_summary(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
-    chance = chance_baselines()[metric]
+    chance = chance_baselines().get(metric, float("nan"))
     grouped = group_by_method_at_k(rows, k, metric)
     rankings = sorted(
         ((m, s, np.mean(v), np.std(v), np.min(v), np.max(v), len(v))
@@ -91,7 +96,7 @@ def print_summary(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
 
 
 def print_interpretation(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
-    chance = chance_baselines()[metric]
+    chance = chance_baselines().get(metric, float("nan"))
     grouped = group_by_method_at_k(rows, k, metric)
     by_sup = defaultdict(list)
     for (m, s), vals in grouped.items():
@@ -123,12 +128,16 @@ def print_interpretation(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
 
 def plot_method_bars(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
     grouped = group_by_method_at_k(rows, k, metric)
-    chance = chance_baselines()[metric]
+    if not grouped:
+        print(f"  skip bars for {metric}: no rows with this metric at k={k}")
+        return
+    chance = chance_baselines().get(metric, float("nan"))
     items = sorted(grouped.items(), key=lambda x: -np.mean(x[1]))
     names = [f"{m}\n[{s}]" for (m, s), _ in items]
     means = [float(np.mean(v)) for _, v in items]
     stds = [float(np.std(v)) for _, v in items]
     colors = ["#1f77b4" if s == "none" else "#ff7f0e" for (_, s), _ in items]
+    n_pairs = len({(r["vision"], r["audio"]) for r in rows})
 
     fig, ax = plt.subplots(figsize=(max(10, 0.8 * len(items)), 5))
     ax.bar(range(len(items)), means, yerr=stds, color=colors, alpha=0.85, capsize=4)
@@ -136,8 +145,10 @@ def plot_method_bars(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
         ax.axhline(chance, linestyle="--", color="grey",
                    label=f"chance = {chance:.3f}")
     ax.set_xticks(range(len(items))); ax.set_xticklabels(names, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel(metric); ax.set_title(f"{metric} per method (k={k}; mean ± std across 12 pairs)")
-    ax.set_ylim(0, max(1.0, max(means) + 0.1)); ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylabel(metric)
+    ax.set_title(f"{metric} per method (k={k}; mean ± std across {n_pairs} pairs)")
+    ymax = max(1.0, max(means) + max(stds) + 0.1) if means else 1.0
+    ax.set_ylim(0, ymax); ax.grid(True, axis="y", alpha=0.3)
     # supervision legend
     from matplotlib.patches import Patch
     handles = [Patch(facecolor="#1f77b4", label="unsupervised"),
@@ -153,7 +164,8 @@ def plot_method_bars(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
 
 
 def plot_k_sweep(rows, metric=PRIMARY_METRIC):
-    chance = chance_baselines()[metric]
+    chance = chance_baselines().get(metric, float("nan"))
+    n_pairs = len({(r["vision"], r["audio"]) for r in rows})
     sup_of = {}
     by_method_k = defaultdict(lambda: defaultdict(list))
     for r in rows:
@@ -179,7 +191,7 @@ def plot_k_sweep(rows, metric=PRIMARY_METRIC):
     if not np.isnan(chance):
         ax.axhline(chance, linestyle=":", color="black", alpha=0.5, label=f"chance = {chance:.3f}")
     ax.set_xscale("log"); ax.set_xlabel("k")
-    ax.set_ylabel(f"mean {metric} (averaged over 12 pairs)")
+    ax.set_ylabel(f"mean {metric} (averaged over {n_pairs} pairs)")
     ax.set_title(f"{metric} vs k by method")
     ax.legend(fontsize=8, loc="best"); ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -189,7 +201,7 @@ def plot_k_sweep(rows, metric=PRIMARY_METRIC):
 
 
 def plot_pair_heatmap(rows, method, k, metric=PRIMARY_METRIC):
-    chance = chance_baselines()[metric]
+    chance = chance_baselines().get(metric, float("nan"))
     visions = sorted({r["vision"] for r in rows})
     audios  = sorted({r["audio"]  for r in rows})
     M = np.full((len(visions), len(audios)), np.nan)
@@ -231,7 +243,7 @@ def plot_paired_vs_unsupervised(rows, k=HEADLINE_K, metric=PRIMARY_METRIC):
         if d["paired"] and d["none"]:
             xs.append(max(d["none"])); ys.append(max(d["paired"]))
             lbls.append(f"{pair[0]}×{pair[1]}")
-    chance = chance_baselines()[metric]
+    chance = chance_baselines().get(metric, float("nan"))
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.scatter(xs, ys, s=70, alpha=0.7)
     for x, y, l in zip(xs, ys, lbls):
@@ -266,25 +278,27 @@ def main():
     print_interpretation(rows, k=HEADLINE_K, metric=PRIMARY_METRIC)
 
     # Plots
-    for metric in ("recall_at_10", "recall_at_5", "hungarian_purity", "instance_r_at_1"):
+    for metric in ("recall_at_11", "recall_at_5", "recall_at_22",
+                   "hungarian_purity", "instance_r_at_1",
+                   "foscttm", "dcor_postdecomp"):
         plot_method_bars(rows, k=HEADLINE_K, metric=metric)
         plot_k_sweep(rows, metric=metric)
 
-    # Per-method pair heatmaps for the interesting candidates
-    for method, k in [
-        ("plain_gw",        None),
-        ("procrustes",      None),
+    # Per-method pair heatmaps for the new method set
+    rp_k = next((r["k"] for r in rows if r["method"] == "random_proj"), None)
+    heatmap_specs = [
+        ("vanilla",         None),
+        ("random_proj",     rp_k),
+        ("svd_truncate",    HEADLINE_K),
+        ("spectral_whiten", HEADLINE_K),
+        ("kpca_rbf",        HEADLINE_K),
+        ("wprocrustes",     HEADLINE_K),
         ("spectral_gw",     HEADLINE_K),
         ("spectral_gw_mr",  HEADLINE_K),
-        ("pca_gw",          HEADLINE_K),
-        ("wprocrustes",     HEADLINE_K),
-        ("cca_cos",         HEADLINE_K),
-        ("ccap_cos",        HEADLINE_K),
-    ]:
+    ]
+    for method, k in heatmap_specs:
         if any(r["method"] == method for r in rows):
             plot_pair_heatmap(rows, method, k)
-
-    plot_paired_vs_unsupervised(rows, k=HEADLINE_K, metric=PRIMARY_METRIC)
 
 
 if __name__ == "__main__":
