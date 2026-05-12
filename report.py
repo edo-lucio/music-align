@@ -38,6 +38,8 @@ def chance_recall_at_k(per_class, n_test, k):
 def chance_baselines(n_test=242, n_class=11):
     """Defaults assume the full-data unsupervised setup (no train/test split)."""
     per = n_test // n_class
+    # MRR chance for uniform-random ranking ≈ (1 + 1/2 + ... + 1/N) / N
+    mrr_chance = float(np.mean(1.0 / np.arange(1, n_test + 1)))
     return {
         "class_purity":     per / n_test,
         "recall_at_5":      chance_recall_at_k(per, n_test, 5),
@@ -49,6 +51,9 @@ def chance_baselines(n_test=242, n_class=11):
         "foscttm":          0.5,
         "gw_cost":          float("nan"),
         "dcor_postdecomp":  float("nan"),
+        "mrr":              mrr_chance,
+        "nmi":              0.0,            # NMI of random labeling ≈ 0
+        "cka":              float("nan"),   # depends on data; no closed-form
     }
 
 
@@ -280,7 +285,8 @@ def main():
     # Plots
     for metric in ("recall_at_11", "recall_at_5", "recall_at_22",
                    "hungarian_purity", "instance_r_at_1",
-                   "foscttm", "dcor_postdecomp"):
+                   "foscttm", "dcor_postdecomp",
+                   "mrr", "nmi", "cka"):
         plot_method_bars(rows, k=HEADLINE_K, metric=metric)
         plot_k_sweep(rows, metric=metric)
 
