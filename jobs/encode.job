@@ -34,4 +34,3 @@ rm -rf cache/inputs cache/embeds cache/captions.json
 
 python ./extract_inputs.py
 python ./encode.py
-python ./encode_text.py

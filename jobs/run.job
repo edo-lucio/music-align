@@ -29,4 +29,4 @@ conda activate "$ENV_PATH"
 cd "$PROJECT_DIR"
 mkdir -p logs
 
-python ./analyze.py
+python ./cca_analysis.py

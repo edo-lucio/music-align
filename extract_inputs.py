@@ -19,7 +19,6 @@ INSTRUMENTS = [
     "saxophone", "trumpet", "tuba", "violin", "xylophone",
 ]
 
-
 def duration(path: Path) -> float:
     out = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
