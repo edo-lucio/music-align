@@ -1,11 +1,9 @@
-"""Unified decomposition + GW comparison matrix.
+"""Unified unsupervised decomposition + GW comparison matrix.
 
-Most methods are unsupervised: they use neither audio↔vision pair correspondences
-nor class labels at fit time. CCA is a paired baseline (uses row-pairing at fit
-time, no class labels) for comparison against the unsupervised methods. Each
-method produces a square score / coupling matrix M, evaluated by class_purity,
-hungarian_purity, recall@{5,11,22}, instance_r@{1,10}, FOSCTTM, MRR, NMI, GW
-cost residual, post-decomp dCor(Cv, Ca), and CKA(1-Cv, 1-Ca).
+All methods are unsupervised: they use neither audio↔vision pair correspondences
+nor class labels at fit time. Each method produces a square score / coupling
+matrix M, evaluated by class_purity, hungarian_purity, recall@{5,11,22},
+instance_r@{1,10}, FOSCTTM, GW cost residual, and post-decomp dCor(Cv, Ca).
 
 Methods:
   NOK (no k):
@@ -18,8 +16,6 @@ Methods:
     wprocrustes     — top-k PCA + Wasserstein-Procrustes rotation; cosine score
     spectral_gw     — normalized-Laplacian RBF eigenmap → entropic GW
     spectral_gw_mr  — spectral_gw with multi-restart (lowest GW cost wins)
-    cca             — Canonical Correlation Analysis into shared k-dim space;
-                      cosine score (PAIRED supervision)
 
 Writes comparison_matrix.json as a flat list of rows; schema matches what
 report.py consumes.
@@ -31,9 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import ot
-from sklearn.cross_decomposition import CCA
 from sklearn.decomposition import KernelPCA
-from sklearn.metrics import normalized_mutual_info_score
 from sklearn.metrics.pairwise import cosine_distances
 
 from analyze import (
@@ -48,12 +42,13 @@ from analyze import (
 
 OUT = Path("comparison_matrix.json")
 SEED = 0
-K_VALUES = [100]
+K_VALUES = [5, 11, 22]
 JL_EPS = 0.5            # k_JL = ceil(8 ln(N) / eps^2)
-EPS_ENTROPIC = 0.005     # matches analyze.gw_entropic
+EPS_ENTROPIC = 0.05     # matches analyze.gw_entropic
 N_RESTARTS = 20         # for spectral_gw_mr
-DEGEN_DCOR = 0.95       # dcor(Cv, Ca) > this => decomposition collapsed; drop row
 
+
+# ---------- decompositions ----------
 
 def jl_k(n, eps=JL_EPS):
     return int(np.ceil(8.0 * np.log(n) / (eps ** 2)))
@@ -83,27 +78,9 @@ def fit_random_proj(X, k, seed):
     return X @ R
 
 
-KPCA_KNN = 7  # bandwidth = median of k-th nearest-neighbor distance
-
-
-def _local_bandwidth(D, knn=KPCA_KNN):
-    """Median of knn-th nearest-neighbor distance.
-
-    Global-median bandwidth degenerates on high-D embeddings where cosine
-    distances concentrate around a constant — the kernel becomes near α·J+(1-α)·I,
-    KernelPCA returns data-blind eigenvectors of the constant subspace, and
-    distinct inputs produce identical outputs. A local bandwidth (driven by each
-    point's own neighborhood) avoids this collapse.
-    """
-    D_self_inf = D.copy()
-    np.fill_diagonal(D_self_inf, np.inf)
-    knn_dist = np.partition(D_self_inf, knn - 1, axis=1)[:, :knn].max(axis=1)
-    return max(float(np.median(knn_dist)), 1e-12)
-
-
 def fit_kpca_rbf(X, k):
     D = cosine_distances(X)
-    sigma = _local_bandwidth(D)
+    sigma = max(np.median(D[D > 0]), 1e-12)
     gamma = 1.0 / (2.0 * sigma ** 2)
     kpca = KernelPCA(n_components=k, kernel="rbf", gamma=gamma, random_state=SEED)
     return kpca.fit_transform(X)
@@ -118,18 +95,6 @@ def fit_spectral_embed(X, k):
     K_norm = K * d_inv_sqrt[:, None] * d_inv_sqrt[None, :]
     _, V = np.linalg.eigh(K_norm)
     return V[:, -k:]  # eigh: ascending -> top-k from the right
-
-
-def fit_cca(Xv, Xa, k):
-    """Canonical Correlation Analysis: projects both modalities into a shared
-    k-dim space where per-component correlation is maximized. Uses row-pairing
-    at fit time -> paired supervision. D > N is acceptable to sklearn (NIPALS),
-    but the result will be overfit at this N=242 since there is no held-out
-    split; treat the score as an in-sample upper bound for paired alignment.
-    """
-    k = min(k, Xv.shape[1], Xa.shape[1], len(Xv) - 1)
-    cca = CCA(n_components=k, max_iter=1000)
-    return cca.fit_transform(Xv, Xa)
 
 
 def fit_wprocrustes_R(X_a, X_b, n_iters=30, sinkhorn_reg=0.05, seed=SEED):
@@ -202,50 +167,6 @@ def chance_recall_at_k(per_class, n_total, k):
     return 1.0 - p
 
 
-def mrr(M):
-    """Mean Reciprocal Rank of the true match (diagonal). Symmetrized.
-    Chance ≈ (1 + H_{N-1})/N ≈ (ln N + γ)/N for large N (about 0.023 at N=242).
-    """
-    N = M.shape[0]
-    s = 0.0
-    for i in range(N):
-        tr = M[i, i]
-        row = M[i].copy(); row[i] = -np.inf
-        rank = 1 + int((row > tr).sum())
-        s += 1.0 / rank
-        tr = M[i, i]
-        col = M[:, i].copy(); col[i] = -np.inf
-        rank = 1 + int((col > tr).sum())
-        s += 1.0 / rank
-    return float(s / (2 * N))
-
-
-def nmi(M, labels_a, labels_b):
-    """Normalized Mutual Information between argmax assignments and labels.
-    Permutation-invariant; insensitive to class-relabeling artifacts in GW.
-    Chance ≈ 0 (sklearn's normalization is symmetric).
-    """
-    preds = labels_b[np.asarray(M).argmax(axis=1)]
-    return float(normalized_mutual_info_score(labels_a, preds))
-
-
-def cka_from_distance(Cv, Ca):
-    """Centered Kernel Alignment using kernels K = 1 - cosine_distance.
-    Permutation-invariant in the feature dimension. CKA ∈ [0, 1]; higher = the
-    two distance geometries are more aligned. Stricter than dCor: HSIC weights
-    high-similarity pairs more.
-    """
-    Kv = 1.0 - Cv
-    Ka = 1.0 - Ca
-    Kv_c = Kv - Kv.mean(0, keepdims=True) - Kv.mean(1, keepdims=True) + Kv.mean()
-    Ka_c = Ka - Ka.mean(0, keepdims=True) - Ka.mean(1, keepdims=True) + Ka.mean()
-    num = (Kv_c * Ka_c).sum()
-    den2 = (Kv_c * Kv_c).sum() * (Ka_c * Ka_c).sum()
-    if den2 <= 0:
-        return 0.0
-    return float(num / np.sqrt(den2))
-
-
 # ---------- methods: each returns (M, gw_cost_or_None, Cv, Ca) ----------
 
 def m_vanilla(Xv, Xa, **_):
@@ -303,16 +224,6 @@ def m_spectral_gw(Xv, Xa, k, **_):
     return pi, c, Cv, Ca
 
 
-def m_cca(Xv, Xa, k, **_):
-    """CCA into a shared k-dim space; cosine-similarity scoring. PAIRED.
-    No GW step -> gw_cost is None. Cv/Ca for the degeneracy filter only.
-    """
-    Vp, Ap = fit_cca(Xv, Xa, k)
-    M = cosine_scores(Vp, Ap)
-    Cv = cost_matrix(Vp); Ca = cost_matrix(Ap)
-    return M, None, Cv, Ca
-
-
 def m_spectral_gw_mr(Xv, Xa, k, n_restarts=N_RESTARTS, **_):
     """Spectral GW with multi-restart: random Dirichlet inits + uniform; keep
     the run with the lowest GW objective."""
@@ -352,9 +263,7 @@ METHODS_K = {
     "wprocrustes":     m_wprocrustes,
     "spectral_gw":     m_spectral_gw,
     "spectral_gw_mr":  m_spectral_gw_mr,
-    "cca":             m_cca,
 }
-PAIRED_METHODS = {"cca"}
 
 
 # ---------- driver ----------
@@ -368,45 +277,29 @@ def eval_M(M, labels):
         "recall_at_22":     recall_at_k(M, labels, labels, 22),
         "instance_r_at_1":  instance_recall_at_k(M, 1),
         "instance_r_at_10": instance_recall_at_k(M, 10),
-        "mrr":              mrr(M),
-        "nmi":              nmi(M, labels, labels),
     }
 
 
 def _make_row(vname, aname, mname, k, M, gw_cost, Cv, Ca, labels):
     return {
         "vision": vname, "audio": aname,
-        "method": mname,
-        "supervision": "paired" if mname in PAIRED_METHODS else "none",
-        "k": k,
+        "method": mname, "supervision": "none", "k": k,
         **eval_M(M, labels),
         "foscttm":         foscttm(M),
         "gw_cost":         (None if gw_cost is None else float(gw_cost)),
         "dcor_postdecomp": distance_correlation(Cv, Ca),
-        "cka":             cka_from_distance(Cv, Ca),
     }
 
 
-def _print_row(row, degenerate=False):
+def _print_row(row):
     tag = f"{row['method']} k={row['k']}" if row["k"] is not None else row["method"]
-    flag = "  ⚠ DEGENERATE (dropped)" if degenerate else ""
+    gw = "—" if row["gw_cost"] is None else f"{row['gw_cost']:.2e}"
     print(f"  {tag:25s}  "
-          f"mrr={row['mrr']:.3f}  "
-          f"nmi={row['nmi']:.3f}  "
-          f"cka={row['cka']:.3f}  "
           f"hung={row['hungarian_purity']:.3f}  "
-          f"r@11={row['recall_at_11']:.3f}  "
+          f"r@5={row['recall_at_5']:.3f}  "
           f"foscttm={row['foscttm']:.3f}  "
-          f"dcor={row['dcor_postdecomp']:.3f}{flag}")
-
-
-def _is_degenerate(row):
-    """A decomposition has collapsed if vision and audio post-decomp distance
-    matrices are nearly identical: dcor(Cv, Ca) close to 1.0. The 'alignment'
-    is then a trivial artifact of the (shared) manifest row ordering, not a
-    cross-modal signal. Filter these rows out before reporting.
-    """
-    return row["dcor_postdecomp"] > DEGEN_DCOR
+          f"gw={gw:>8s}  "
+          f"dcor={row['dcor_postdecomp']:.3f}")
 
 
 def main():
@@ -437,17 +330,12 @@ def main():
                 print(f"  {mname:17s} FAILED: {e.__class__.__name__}: {e}")
                 continue
             row = _make_row(vname, aname, mname, None, M, gw_cost, Cv, Ca, labels)
-            if _is_degenerate(row):
-                _print_row(row, degenerate=True); continue
             rows.append(row); _print_row(row)
 
         try:
             M, gw_cost, Cv, Ca = m_random_proj(Xv, Xa, k=k_JL)
             row = _make_row(vname, aname, "random_proj", k_JL, M, gw_cost, Cv, Ca, labels)
-            if _is_degenerate(row):
-                _print_row(row, degenerate=True)
-            else:
-                rows.append(row); _print_row(row)
+            rows.append(row); _print_row(row)
         except Exception as e:
             print(f"  random_proj k={k_JL:<3d} FAILED: {e.__class__.__name__}: {e}")
 
@@ -459,8 +347,6 @@ def main():
                     print(f"  {mname:17s} k={k:<3d} FAILED: {e.__class__.__name__}: {e}")
                     continue
                 row = _make_row(vname, aname, mname, k, M, gw_cost, Cv, Ca, labels)
-                if _is_degenerate(row):
-                    _print_row(row, degenerate=True); continue
                 rows.append(row); _print_row(row)
 
     OUT.write_text(json.dumps(rows, indent=2))
